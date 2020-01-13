@@ -51,7 +51,7 @@ async fn main() -> io::Result<()> {
     // args as defined, with the addition of a Context, which is always the first arg. The Context
     // specifies a deadline and trace information which can be helpful in debugging requests.
     let hello = client.hello(context::current(), name).await?;
-
+    
     println!("{}", hello);
 
     Ok(())

@@ -13,6 +13,8 @@ use futures::prelude::*;
 use std::io;
 
 pub mod channel;
+//pub mod multiplex;
+pub mod multiplex_new;
 
 pub(crate) mod sealed {
     use super::*;
