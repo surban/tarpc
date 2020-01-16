@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use async_std::task;
 
 use futures::channel::mpsc;
-use futures::channel::mpsc::{channel, Receiver, SendError, Sender};
 use futures::channel::oneshot;
 use futures::executor::block_on;
 use futures::lock::Mutex as AsyncMutex;
@@ -34,7 +33,7 @@ use tokio_serde::{Deserializer, Serializer};
 
 //use crate::Transport;
 
-pub enum MultiplexMsg<SerializedContent> {
+pub enum MultiplexMsg<Content> {
     /// Open connection to service on specified client port.
     Open { service: u32, client_port: u32 },
     /// Connection to service refused.
@@ -45,14 +44,16 @@ pub enum MultiplexMsg<SerializedContent> {
     Pause { port: u32 },
     /// Resume sending data on specified port.
     Resume { port: u32 },
-    /// No more data will be sent on specifed port.
+    /// No more data will be sent to specifed remote port.
     Finish { port: u32 },
-    /// Not interested on receiving any more data on specified port.
+    /// Acknowledgement that Finish has been received for the specified remote port.
+    FinishAck { port: u32 },
+    /// Not interested on receiving any more data from specified remote port.
     Hangup { port: u32, graceful: bool },
     /// Data for specified port.
     Data {
         port: u32,
-        content: SerializedContent,
+        content: Content,
     },
 }
 
@@ -63,10 +64,82 @@ pub struct Multiplexer<ContentSerializer, ContentDeserializer> {
 
 #[derive(Debug, Clone)]
 pub enum MultiplexRunError<TransportSinkError, TransportStreamError> {
-    SendError(Arc<TransportSinkError>),
-    ReceiveError(Arc<TransportStreamError>),
+    SendError(TransportSinkError),
+    ReceiveError(TransportStreamError),
     ReceiverClosed,
     ProtocolError(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelSendError {
+    /// Other side closed receiving end of channel.
+    Closed { 
+        /// True if other side still processes items send up until now.
+        gracefully: bool,
+    },
+    /// The multiplexer encountered an error or was terminated.
+    MultiplexerError
+}
+
+impl From<mpsc::SendError> for ChannelSendError
+{
+    fn from(err: mpsc::SendError) -> Self {
+        if err.is_disconnected() {
+            return Self::MultiplexerError;
+        }
+        panic!("Error sending data to multiplexer for unknown reasons.");
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub enum ChannelReceiveError {
+    /// The multiplexer encountered an error or was terminated.
+    MultiplexerError
+}
+
+
+
+/// Allocates numbers randomly and uniquely.
+struct NumberAllocator {
+    used: HashSet<u32>,
+    rng: ThreadRng,
+}
+
+/// Number allocated exhausted.
+#[derive(Debug, Clone)]
+struct NumberAllocatorExhaustedError;
+
+impl NumberAllocator {
+    /// Creates a new number allocator.
+    fn new() -> NumberAllocator {
+        NumberAllocator {
+            used: HashSet::new(),
+            rng: thread_rng(),
+        }
+    }
+
+    /// Allocates a random, unique number.
+    fn allocate(&mut self) -> Result<u32, NumberAllocatorExhaustedError> {
+        if self.used.len() >= std::u32::MAX / 2 {
+            return Err(NumberAllocatorExhaustedError);
+        }
+        loop {
+            let cand = self.rng.gen();
+            if !self.used.contains(&cand) {
+                self.used.insert(cand);
+                return Ok(cand);
+            }
+        }
+    }
+
+    /// Releases a previously allocated number.
+    /// Panics when the number is currently not allocated.
+    fn release(&mut self, number: u32) {
+        if !self.used.remove(&number) {
+            panic!("NumberAllocator cannot release number {} that is currently not allocated.", number);
+        }
+    }
 }
 
 /// Sets the send lock state of a channel.
@@ -79,10 +152,16 @@ struct ChannelSendLockRequester {
     state: Arc<AsyncMutex<ChannelSendLockState>>,
 }
 
+enum ChannelSendLockCloseReason {
+    Closed {gracefully: bool},
+    Dropped
+}
+
 /// Internal state of a channel send lock.
 struct ChannelSendLockState {
     send_allowed: bool,
-    send_allowed_notify_tx: Option<oneshot::Sender<()>>,
+    close_reason: Option<ChannelSendLockCloseReason>,
+    notify_tx: Option<oneshot::Sender<()>>,
 }
 
 impl ChannelSendLockAuthority {
@@ -97,15 +176,42 @@ impl ChannelSendLockAuthority {
         let mut state = self.state.lock().await;
         state.send_allowed = true;
 
-        if let Some(tx) = state.send_allowed_notify_tx.take() {
+        if let Some(tx) = state.notify_tx.take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Closes the channel.
+    async fn close(mut self, gracefully: bool) {
+        let mut state = self.state.lock().await;
+        state.send_allowed = false;
+        state.close_reason = Some(ChannelSendLockCloseReason::Closed {gracefully});
+
+        if let Some(tx) = state.notify_tx.take() {
+            let _ = tx.send(());
+        }        
+    }
+}
+
+impl Drop for ChannelSendLockAuthority {
+    fn drop(&mut self) {
+        block_on(async {
+            let mut state = self.state.lock().await;
+            if state.close_reason.is_none() {
+                state.send_allowed = false;            
+                state.close_reason = Some(ChannelSendLockCloseReason::Dropped);
+
+                if let Some(tx) = state.notify_tx.take() {
+                    let _ = tx.send(());
+                }                    
+            }
+        });
     }
 }
 
 impl ChannelSendLockRequester {
     /// Blocks until sending on the channel is allowed.
-    async fn request(&self) {
+    async fn request(&self) -> Result<(), ChannelSendError> {
         let mut rx_opt = None;
         loop {
             if let Some(rx) = rx_opt {
@@ -114,11 +220,16 @@ impl ChannelSendLockRequester {
 
             let mut state = self.state.lock().await;
             if state.send_allowed {
-                return;
+                return Ok(());
+            } 
+            match &state.close_reason {
+                Some (ChannelSendLockCloseReason::Closed {gracefully}) => return Err(ChannelSendError::Closed {gracefully: gracefully.clone()}),
+                Some (ChannelSendLockCloseReason::Dropped) => return Err(ChannelSendError::MultiplexerError),
+                None => ()                
             }
 
             let (tx, rx) = oneshot::channel();
-            state.send_allowed_notify_tx = Some(tx);
+            state.notify_tx = Some(tx);
             rx_opt = Some(rx);
         }
     }
@@ -128,7 +239,8 @@ impl ChannelSendLockRequester {
 fn channel_send_lock() -> (ChannelSendLockAuthority, ChannelSendLockRequester) {
     let state = Arc::new(Mutex::new(ChannelSendLockState {
         send_allowed: true,
-        send_allowed_notify_tx: None,
+        close_reason: None,
+        notify_tx: None,
     }));
     let authority = ChannelSendLockAuthority {
         state: state.clone(),
@@ -140,20 +252,20 @@ fn channel_send_lock() -> (ChannelSendLockAuthority, ChannelSendLockRequester) {
 }
 
 /// Channel receiver buffer item enqueuer.
-struct ChannelReceiverBufferEnqueuer<SerializedContent> {
-    state: Arc<AsyncMutex<ChannelReceiverBufferState<SerializedContent>>>,
-    cfg: ChannelReceiverBufferCfg,
+struct ChannelReceiverBufferEnqueuer<Content> {
+    state: Arc<AsyncMutex<ChannelReceiverBufferState<Content>>>,
+    cfg: ChannelReceiverBufferCfg<Content>,
 }
 
 /// Channel receiver buffer item dequeuer.
-struct ChannelReceiverBufferDequeuer<SerializedContent> {
-    state: Arc<AsyncMutex<ChannelReceiverBufferState<SerializedContent>>>,
-    cfg: ChannelReceiverBufferCfg,
+struct ChannelReceiverBufferDequeuer<Content> {
+    state: Arc<AsyncMutex<ChannelReceiverBufferState<Content>>>,
+    cfg: ChannelReceiverBufferCfg<Content>,
 }
 
 /// Channel receive buffer configuration.
 #[derive(Clone)]
-struct ChannelReceiverBufferCfg {
+struct ChannelReceiverBufferCfg<Content> {
     /// Buffer length that will trigger sending resume notification.
     resume_length: usize,
     /// Buffer length that will trigger sending pause notification.
@@ -161,53 +273,59 @@ struct ChannelReceiverBufferCfg {
     /// When buffer length reaches this value, enqueue function will block.
     block_length: usize,
     /// Resume notification sender.
-    resume_notify_tx: Sender<u32>,
-    /// Resume notification send value.
-    resume_notify_port: u32,
+    resume_notify_tx: mpsc::Sender<ChannelMsg<Content>>,
+    /// Local port for resume notification.
+    local_port: u32,
+}
+
+enum ChannelReceiverBufferCloseReason {
+    Closed,
+    Dropped
 }
 
 /// Internal state of channel receiver buffer.
-struct ChannelReceiverBufferState<SerializedContent> {
-    buffer: VecDeque<SerializedContent>,
+struct ChannelReceiverBufferState<Content> {
+    buffer: VecDeque<Content>,
+    close_reason: Option<ChannelReceiverBufferCloseReason>,
     item_enqueued: Option<oneshot::Sender<()>>,
     item_dequeued: Option<oneshot::Sender<()>>,
-    finished: bool,
 }
 
-/// Creates a new channel receiver buffer.
-fn channel_receiver_buffer<SerializedContent>(
-    cfg: ChannelReceiverBufferCfg,
-) -> (
-    ChannelReceiverBufferEnqueuer<SerializedContent>,
-    ChannelReceiverBufferDequeuer<SerializedContent>,
-) {
-    assert!(cfg.resume_length > 0);
-    assert!(cfg.pause_length > cfg.resume_length);
-    assert!(cfg.block_length > cfg.pause_length);
-
-    let state = AsyncMutex::new(ChannelReceiverBufferState {
-        buffer: VecDeque::new(),
-        item_enqueued: None,
-        item_dequeued: None,
-        finished: false,
-    });
-
-    let enqueuer = ChannelReceiverBufferEnqueuer {
-        state: state.clone(),
-        cfg: cfg.clone(),
-    };
-    let dequeuer = ChannelReceiverBufferDequeuer {
-        state: state.clone(),
-        cfg: cfg.clone(),
-    };
-    (enqueuer, dequeuer)
+impl<Content> ChannelReceiverBufferCfg<Content> {
+    /// Creates a new channel receiver buffer and returns the associated
+    /// enqueuer and dequeuer.
+    fn instantiate(self) -> (
+        ChannelReceiverBufferEnqueuer<Content>,
+        ChannelReceiverBufferDequeuer<Content>,
+    ) {
+        assert!(self.resume_length > 0);
+        assert!(self.pause_length > self.resume_length);
+        assert!(self.block_length > self.pause_length);
+    
+        let state = AsyncMutex::new(ChannelReceiverBufferState {
+            buffer: VecDeque::new(),
+            close_reason: None,
+            item_enqueued: None,
+            item_dequeued: None,
+        });
+    
+        let enqueuer = ChannelReceiverBufferEnqueuer {
+            state: state.clone(),
+            cfg: self.clone(),
+        };
+        let dequeuer = ChannelReceiverBufferDequeuer {
+            state: state.clone(),
+            cfg: self,
+        };
+        (enqueuer, dequeuer)
+    }
 }
 
-impl<SerializedContent> ChannelReceiverBufferEnqueuer<SerializedContent> {
+impl<Content> ChannelReceiverBufferEnqueuer<Content> {
     /// Enqueues an item into the receive queue.
     /// Blocks when the block queue length has been reached.
     /// Returns true when the pause queue length has been reached from below.
-    async fn enqueue(&self, item: SerializedContent) -> bool {
+    async fn enqueue(&self, item: Content) -> bool {
         let mut rx_opt = None;
         loop {
             if let Some(rx) = rx_opt {
@@ -236,25 +354,36 @@ impl<SerializedContent> ChannelReceiverBufferEnqueuer<SerializedContent> {
         let state = self.state.lock().await;
         state.buffer.len() <= self.cfg.resume_length
     }
+
+    /// Indicates that the receive stream is finished.
+    async fn close(mut self) {
+        let state = self.state.lock().await;
+        state.close_reason = Some(ChannelReceiverBufferCloseReason::Closed);
+        if let Some(tx) = state.item_enqueued.take() {
+            let _ = tx.send(());
+        }            
+    }
 }
 
-impl<SerializedContent> Drop for ChannelReceiverBufferEnqueuer<SerializedContent> {
+impl<Content> Drop for ChannelReceiverBufferEnqueuer<Content> {
     fn drop(&mut self) {
         block_on(async move {
             let state = self.state.lock().await;
-            state.finished = true;
-            if let Some(tx) = state.item_enqueued.take() {
-                let _ = tx.send(());
-            }            
+            if state.close_reason.is_none() {
+                state.close_reason = Some(ChannelReceiverBufferCloseReason::Dropped);
+                if let Some(tx) = state.item_enqueued.take() {
+                    let _ = tx.send(());
+                }            
+            }
         });
     }
 }
 
-impl<SerializedContent> ChannelReceiverBufferDequeuer<SerializedContent> {
+impl<Content> ChannelReceiverBufferDequeuer<Content> {
     /// Dequeues an item from the receive queue.
     /// Blocks until an item becomes available.
     /// Notifies the resume notify channel when the resume queue length has been reached from above.
-    async fn dequeue(&self) -> Option<SerializedContent> {
+    async fn dequeue(&self) -> Option<Result<Content, ChannelReceiveError>> {
         let mut rx_opt = None;
         loop {
             if let Some(rx) = rx_opt {
@@ -263,13 +392,15 @@ impl<SerializedContent> ChannelReceiverBufferDequeuer<SerializedContent> {
 
             let state = self.state.lock().await;
             if state.buffer.is_empty() {
-                if state.finished {
-                    return None;
-                } else {                
-                    let (tx, rx) = oneshot::channel();
-                    state.item_enqueued = Some(tx);
-                    rx_opt = Some(rx);
-                    continue;
+                match &state.close_reason {
+                    Some (ChannelReceiverBufferCloseReason::Closed) => return None,
+                    Some (ChannelReceiverBufferCloseReason::Dropped) => return Some(Err(ChannelReceiveError::MultiplexerError)),
+                    None => {                
+                        let (tx, rx) = oneshot::channel();
+                        state.item_enqueued = Some(tx);
+                        rx_opt = Some(rx);
+                        continue;
+                    }
                 }
             }
 
@@ -281,163 +412,99 @@ impl<SerializedContent> ChannelReceiverBufferDequeuer<SerializedContent> {
             if state.buffer.len() == self.cfg.resume_length {
                 self.cfg
                     .resume_notify_tx
-                    .send(self.cfg.resume_notify_port)
+                    .send(ChannelMsg::ReceiveBufferReachedResumeLength {local_port: self.cfg.local_port})
                     .await;
             }
 
-            return Some(item);
+            return Some(Ok(item));
         }
     }
 }
 
-#[derive(Clone)]
-struct ServiceConnectData {
-    service: u32,
-    client_port: u32,
-    server_port: u32,
-}
-
-#[derive(Debug, Clone)]
-pub enum ChannelSendError<TransportSinkError, TransportStreamError, SerializationError> {
-    /// Other side closed receive end of channel.
-    Closed {
-        graceful: bool,
-    },
-    /// Serialization of item to send failed.
-    SerializationError(SerializationError),
-    TransportSendError(Arc<TransportSinkError>),
-    TransportReceiveError(Arc<TransportStreamError>),
-    TransportClosed,
-    MultiplexProtocolError(String),
-}
-
-impl<TransportSinkError, TransportStreamError, SerializationError>
-    From<MultiplexRunError<TransportSinkError, TransportStreamError>>
-    for ChannelSendError<TransportSinkError, TransportStreamError, SerializationError>
-{
-    fn from(err: MultiplexRunError<TransportSinkError, TransportStreamError>) -> Self {
-        match err {
-            MultiplexRunError::SendError(data) => Self::TransportSendError(data),
-            MultiplexRunError::ReceiveError(data) => Self::TransportReceiveError(data),
-            MultiplexRunError::ReceiverClosed => Self::TransportClosed,
-            MultiplexRunError::ProtocolError(data) => Self::ProtocolError(data),
-        }
-    }
-}
-
-impl<TransportSinkError, TransportStreamError, SerializationError> From<mpsc::SendError>
-    for ChannelSendError<TransportSinkError, TransportStreamError, SerializationError>
-{
-    fn from(err: mpsc::SendError) -> Self {
-        if err.is_disconnected() {
-            return Self::Closed { graceful: false };
-        }
-        panic!("Unknown channel close reason.");
-    }
-}
-
-pub trait InnerSerializer<T, I> {
-    type Error;
-    fn serialize(&mut self, item: &T) -> Result<I, Self::Error>;
-}
-
-struct ChannelSenderData<
-    Item,
-    ItemSerializer,
-    SerializedContent,
-    TransportSinkError,
-    TransportStreamError,
-> {
-    data: ServiceConnectData,
-    serializer: ItemSerializer,
+struct ChannelData<Content> {
+    local_port: u32,
+    remote_port: u32,
+    tx: mpsc::Sender<ChannelMsg<Content>>,
     tx_lock: ChannelSendLockRequester,
-    our_port: u32,
-    other_port: u32,
-    tx: Sender<ChannelMsg<SerializedContent>>,
-    global_error: Arc<RwLock<Option<MultiplexRunError<TransportSinkError, TransportStreamError>>>>,
+    rx_buffer: ChannelReceiverBufferDequeuer<Content>,
+}
+
+impl<Content> ChannelData<Content> {
+    fn instantiate(self) -> (ChannelSender<Content>, ChannelReceiver<Content>) {
+        let ChannelData {
+            local_port, remote_port, tx, tx_lock, rx_buffer
+        } = self;
+        
+        let sender = ChannelSender::new(
+            local_port,
+            remote_port,
+            tx.clone(),
+            tx_lock
+        );
+        let receiver = ChannelReceiver::new(
+            local_port,
+            remote_port,
+            tx,
+            rx_buffer
+        );
+        (sender, receiver)
+    }
 }
 
 #[pin_project]
-pub struct ChannelSender<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError> {
-    data: ServiceConnectData,
-    our_port: u32,
-    other_port: u32,
+pub struct ChannelSender<Content> {
+    local_port: u32,
+    remote_port: u32,
     #[pin]
     sink: Box<
         dyn Sink<
-            Item,
-            Error = ChannelSendError<TransportSinkError, TransportStreamError, SerializationError>,
+            Content,
+            Error = ChannelSendError,
         >,
     >,
     #[pin]
-    drop_tx: Sender<ChannelMsg<SerializedContent>>,
+    drop_tx: mpsc::Sender<ChannelMsg<Content>>,
 }
 
-impl<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError>
-    ChannelSender<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError>
+impl<Content>
+    ChannelSender<Content>
 {
-    fn new<ItemSerializer>(
-        data: ChannelSenderData<
-            Item,
-            ItemSerializer,
-            SerializedContent,
-            TransportSinkError,
-            TransportStreamError,
-        >,
-    ) -> ChannelSender<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError>
+    fn new(
+        local_port: u32,
+        remote_port: u32,
+        tx: mpsc::Sender<ChannelMsg<Content>>,
+        tx_lock: ChannelSendLockRequester,
+    ) -> ChannelSender<Content>
     where
-        ItemSerializer:
-            InnerSerializer<Item, SerializedContent, Error = SerializationError> + 'static,
-        TransportStreamError: 'static,
-        TransportSinkError: 'static,
-        SerializedContent: 'static,
-        Item: 'static,
+        Content: 'static,
     {
-        let ChannelSenderData {
-            data,
-            serializer,
-            tx_lock,
-            our_port, other_port,
-            tx,
-            global_error,
-        } = data;
-
         let drop_tx = tx.clone();
-        let tx_adapted = tx.with(|item: Item| {
+        let adapted_tx = tx.with(|item: Content| {
             async move {
-                if let Some(err) = global_error.read().unwrap().as_ref() {
-                    return Err(ChannelSendError::from(*err.clone()));
-                }
-                tx_lock.request().await;
-                let content = serializer
-                    .serialize(&item)
-                    .map_err(ChannelSendError::SerializationError)?;
+                tx_lock.request().await?;
                 let msg = ChannelMsg::SendMsg {
-                    port: other_port,
-                    content,
+                    remote_port,
+                    content: item,
                 };
                 Ok::<
-                    ChannelMsg<SerializedContent>,
-                    ChannelSendError<TransportSinkError, TransportStreamError, SerializationError>,
+                    ChannelMsg<Content>,
+                    ChannelSendError,
                 >(msg)
             }
         });
 
         ChannelSender {
-            data: data,
-            our_port,
-            other_port,
-            sink: Box::new(tx_adapted),
+            local_port,
+            remote_port,
+            sink: Box::new(adapted_tx),
             drop_tx
         }
     }
 }
 
-impl<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError> Sink<Item>
-    for ChannelSender<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError>
+impl<Item> Sink<Item> for ChannelSender<Item>
 {
-    type Error = ChannelSendError<TransportSinkError, TransportStreamError, SerializationError>;
-
+    type Error = ChannelSendError;
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
         let this = self.project();
         this.sink.poll_ready(cx)
@@ -457,103 +524,123 @@ impl<Item, SerializedContent, TransportSinkError, TransportStreamError, Serializ
 }
 
 #[pinned_drop]
-impl<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError> PinnedDrop
-for ChannelSender<Item, SerializedContent, TransportSinkError, TransportStreamError, SerializationError> {
+impl<Item> PinnedDrop
+for ChannelSender<Item> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
         block_on(async move {
-            this.drop_tx.send(ChannelMsg::SenderDropped {port: *this.other_port}).await;
+            this.drop_tx.send(ChannelMsg::SenderDropped {local_port: *this.local_port}).await;
         });
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ChannelReceiveError<TransportSinkError, TransportStreamError, DeserializationError> {
-    /// Deserialization of received item failed.
-    DeserializationError(DeserializationError),
-    TransportSendError(Arc<TransportSinkError>),
-    TransportReceiveError(Arc<TransportStreamError>),
-    TransportClosed,
-    MultiplexProtocolError(String),
+#[pin_project]
+pub struct ChannelReceiver<Content> {
+    local_port: u32,
+    remote_port: u32,
+    closed: bool,
+    #[pin]
+    stream: Box<dyn Stream<Item=Result<Content, ChannelReceiveError>>>,
+    #[pin]
+    drop_tx: mpsc::Sender<ChannelMsg<Content>>,
 }
 
+impl<Content> ChannelReceiver<Content> {
+    fn new(
+        local_port: u32,
+        remote_port: u32,        
+        tx: mpsc::Sender<ChannelMsg<Content>>,
+        rx_buffer: ChannelReceiverBufferDequeuer<Content>,
+    ) -> ChannelReceiver<Content> 
+    where Content: 'static {
+        let stream =
+            stream::repeat(()).then(|_| async move {
+                rx_buffer.dequeue().await
+            }).take_while(|opt_item| future::ready(opt_item.is_some()))
+            .map(|opt_item| opt_item.unwrap());
 
-struct ChannelReceiverData<Item, SerializedContent> {
-    data: ServiceConnectData,
-    tx: Sender<ChannelMsg<SerializedContent>>,
-    rx_buffer: ChannelReceiverBufferDequeuer<SerializedContent>,
-}
-
-pub struct ChannelReceiver<Item, SerializedContent, TransportSinkError, TransportStreamError, DeserializationError> {
-    stream: Box<dyn Stream<Item=Result<Item, ChannelReceiveError<TransportSinkError, TransportStreamError, DeserializationError>>>>
-}
-
-impl <Item, SerializedContent, TransportSinkError, TransportStreamError, DeserializationError> ChannelReceiver<Item, SerializedContent, TransportSinkError, TransportStreamError, DeserializationError> {
-    fn new(data: ChannelReceiverData<Item, SerializedContent>) -> ChannelReceiver<Item, SerializedContent, TransportSinkError, TransportStreamError, DeserializationError> {
-        // iter, then map, then take_while, then map (to remove option)
-
-    }
-}
-
-impl<Item, TransportSinkError, TransportStreamError, DeserializationError> Stream for 
-    ChannelReceiver<Item, SerializedContent>
-{
-    type Item = Result<Item, ChannelReceiveError<TransportSinkError, TransportStreamError, DeserializationError>>;
-
-}
-
-struct ServiceConnectRequest<SerializedContent> {
-    receiver_buffer: Option<ChannelReceiverBufferDequeuer<SerializedContent>>,
-    data: ServiceConnectData,
-    response_tx: Sender<ServiceConnectResponse<SerializedContent>>,
-    accepted: bool,
-}
-
-struct ServiceConnectResponse<SerializedContent> {
-    data: ServiceConnectData,
-    decision: ServiceConnectDecision<SerializedContent>,
-}
-
-enum ServiceConnectDecision<SerializedContent> {
-    Accepted {
-        enqueuer: ChannelReceiverBufferEnqueuer<SerializedContent>,
-    },
-    Rejected,
-}
-
-impl<SerializedContent> ServiceConnectRequest<SerializedContent> {
-    pub async fn accept(self) {
-        let (buf_enqueuer, buf_dequeuer) =
-            channel_receiver_buffer(self.receiver_buffer_cfg.take().unwrap());
-        self.response_tx
-            .send(ServiceConnectResponse {
-                data: self.data.clone(),
-                decision: ServiceConnectDecision::Accepted {
-                    enqueuer: buf_enqueuer,
-                },
-            })
-            .await;
-        self.accepted = true;
+        ChannelReceiver {
+            local_port,
+            remote_port,
+            closed: false,
+            drop_tx: tx,
+            stream: Box::new(stream),
+        }       
     }
 
-    pub async fn reject(self) {
-        // Will be rejected by dropping.
-        drop(self);
-    }
-}
-
-impl<SerializedContent> Drop for ServiceConnectRequest<SerializedContent> {
-    fn drop(&mut self) {
-        if !self.accepted {
+    /// Prevents the remote endpoint from sending new messages into this channel while
+    /// allowing in-flight messages to be received.
+    pub fn close(&mut self) {
+        if !self.closed {
             block_on(async {
-                let _ = self
-                    .response_tx
-                    .send(ServiceConnectResponse {
-                        data: self.data.clone(),
-                        decision: ServiceConnectDecision::Rejected,
-                    })
-                    .await;
+                self.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: self.local_port, gracefully: true}).await;
+            });        
+            self.closed = true;
+        }
+    }
+}
+
+impl<Item> Stream for ChannelReceiver<Item>
+{
+    type Item = Result<Item, ChannelReceiveError>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.stream.poll_next(cx)        
+    }
+}
+
+#[pinned_drop]
+impl<Item> PinnedDrop for ChannelReceiver<Item> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if !*this.closed {
+            block_on(async {
+                this.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: *this.local_port, gracefully: false}).await;
             });
+        }
+    }
+}
+
+/// A service request by the remote endpoint.
+struct RemoteConnectToServiceRequest<Content> {
+    channel_data: Option<ChannelData<Content>>,
+    response_tx: mpsc::Sender<ChannelMsg<Content>>,
+}
+
+impl<Content> RemoteConnectToServiceRequest<Content> {
+    fn new(channel_data: ChannelData<Content>, response_tx: mpsc::Sender<ChannelMsg<Content>>)
+        -> RemoteConnectToServiceRequest<Content> 
+    {
+        RemoteConnectToServiceRequest {
+            channel_data: Some(channel_data),
+            response_tx
+        }
+    }
+
+    /// Accepts the service request and returns a pair of channel sender and receiver.
+    pub fn accept(self) -> (ChannelSender<Content>, ChannelReceiver<Content>) {
+        let channel_data = self.channel_data.take().unwrap();
+        block_on(async {
+            let _ = self.response_tx.send(ChannelMsg::Accepted {local_port: channel_data.local_port}).await;
+        });
+        channel_data.instantiate()
+    }
+
+    /// Rejects the service request, optionally providing the specified reason to the remote endpoint.
+    pub fn reject(self, reason: Option<Content>) {
+        let channel_data = self.channel_data.take().unwrap();
+        block_on(async {
+            let _ = self.response_tx.send(ChannelMsg::Rejected {local_port: channel_data.local_port, reason}).await;
+        });
+    }
+}
+
+impl<Content> Drop for RemoteConnectToServiceRequest<Content> {
+    fn drop(&mut self) {
+        if let Some(channel_data) = self.channel_data.take() {
+            block_on(async {
+                let _ = self.response_tx.send(ChannelMsg::Rejected {local_port: channel_data.local_port, reason: None}).await;
+            });    
         }
     }
 }
@@ -563,88 +650,77 @@ pub struct Cfg {
     pub channel_rx_queue_length: usize,
 }
 
-/// Allocates numbers randomly and uniquely.
-struct NumberAllocator {
-    used: HashSet<u32>,
-    rng: ThreadRng,
+
+struct PortData<Content> {
+    local_port: u32,
+    tx_lock: ChannelSendLockAuthority,
+    rx_buffer: Option<ChannelReceiverBufferEnqueuer<Content>>,
+    tx_finished: bool,
+    tx_finished_ack: bool,
+    rx_finished: bool,
+    state: PortState
 }
 
-impl NumberAllocator {
-    /// Creates a new number allocator.
-    fn new() -> NumberAllocator {
-        NumberAllocator {
-            used: HashSet::new(),
-            rng: thread_rng(),
-        }
-    }
+enum PortState {
+    LocalRequestingRemoteService,
+    RemoteRequestingLocalService {remote_port: u32},
+    Connected {remote_port: u32},
+}
 
-    /// Allocates a random, unique number.
-    /// Panics when more than 2,147,483,647 numbers are allocated.
-    fn allocate(&mut self) -> u32 {
-        if self.used.len() >= std::u32::MAX / 2 {
-            panic!("NumberAllocator is out of numbers to allocate.");
-        }
-        loop {
-            let cand = self.rng.gen();
-            if !self.used.contains(&cand) {
-                self.used.insert(cand);
-                return cand;
-            }
-        }
-    }
-
-    /// Releases a previously allocated number.
-    /// Panics when the number is currently not allocated.
-    fn release(&mut self, number: u32) {
-        if !self.used.remove(&number) {
-            panic!("NumberAllocator cannot release a number that is currently not allocated.");
+impl<Content> PortData<Content> {
+    fn remote_port(&self) -> u32 {
+        match &self.state {
+            PortState::Connected {remote_port} => remote_port,
+            _ => panic!("Port unexpectedly not in connected state.")
         }
     }
 }
 
-enum PortState<SerializedContent> {
-    ClientConnecting {
-        recv_buffer: ChannelReceiverBufferEnqueuer<SerializedContent>,
-        response_tx: oneshot::Sender<ServiceConnectData>,
-        service: u32,
-    },
-    Connected {
-        send_lock: ChannelSendLockAuthority,
-        recv_buffer: ChannelReceiverBufferEnqueuer<SerializedContent>,
-    },
-}
 
-enum ChannelMsg<SerializedContent> {
+enum ChannelMsg<Content> {
     /// Send message with content.
     SendMsg {
-        port: u32,
-        content: SerializedContent,
+        remote_port: u32,
+        content: Content,
     },
     /// Sender has been dropped.
-    SenderDropped { port: u32 },
+    SenderDropped { local_port: u32 },
     /// Receiver has been dropped.
-    ReceiverDropped { port: u32 },
+    ReceiverClosed { local_port: u32, gracefully: bool },
+    /// Connection has been accepted.
+    Accepted {local_port: u32},
+    /// Connection has been rejected.
+    Rejected {local_port: u32, reason: Option<Content>},
+    /// The channel receive buffer has reached the resume length from above.
+    ReceiveBufferReachedResumeLength {local_port: u32},
 }
 
-enum LoopEvent<SerializedContent, TransportStreamError> {
-    /// Send message over transport.
-    SendMsg(MultiplexMsg<SerializedContent>),
-    /// Received message from transport.
-    ReceiveMsg(Result<MultiplexMsg<SerializedContent>, TransportStreamError>),
-    /// Connect to service with specified id on other side.
-    ServiceConnectRequest {
-        service: u32,
-        recv_buffer: ChannelReceiverBufferEnqueuer<SerializedContent>,
-        response_tx: oneshot::Sender<ServiceConnectData>,
+struct ConnectToRemoteServiceRequest<Content> {
+    service: Content,
+    response_tx: oneshot::Sender<ConnectToRemoteServiceResponse<Content>>,
+}
+
+enum ConnectToRemoteServiceResponse<Content> {
+    Accepted {
+        sender: ChannelSender<Content>,
+        receiver: ChannelReceiver<Content>,
     },
-    /// Answer to connect request from other side.
-    ServiceConnectResponse(ServiceConnectResponse<SerializedContent>),
-    /// A channel receive buffer has reached the resume length from above.
-    BufferReachedResumeLength(u32),
+    Rejected {
+        reason: Option<Content>
+    }
+}
+
+enum LoopEvent<Content, TransportStreamError> {
+    /// A message from a local channel.
+    ChannelMsg (ChannelMsg<Content>),
+    /// Received message from transport.
+    ReceiveMsg(Result<MultiplexMsg<Content>, TransportStreamError>),
+    /// Connect to service with specified id on the remote side.
+    ConnectToRemoteServiceRequest (ConnectToRemoteServiceRequest<Content>),
 }
 
 async fn run<
-    SerializedContent,
+    Content,
     TransportSink,
     TransportStream,
     TransportSinkError,
@@ -653,18 +729,16 @@ async fn run<
     cfg: Cfg,
     transport_tx: TransportSink,
     transport_rx: TransportStream,
-    req_tx: Sender<LoopEvent<SerializedContent, TransportStreamError>>,
-    req_rx: Receiver<LoopEvent<SerializedContent, TransportStreamError>>,
-    accept_tx: Arc<Mutex<HashMap<u32, Sender<ServiceConnectRequest<SerializedContent>>>>>,
+    connect_rx: mpsc::Receiver<ConnectToRemoteServiceRequest<Content>>,
+    serve_tx: mpsc::Sender<(Content, RemoteConnectToServiceRequest<Content>)>,
 ) -> Result<(), MultiplexRunError<TransportSinkError, TransportStreamError>>
 where
-    TransportSink: Sink<MultiplexMsg<SerializedContent>, Error = TransportSinkError>,
-    TransportStream: Stream<Item = Result<MultiplexMsg<SerializedContent>, TransportStreamError>>,
+    TransportSink: Sink<MultiplexMsg<Content>, Error = TransportSinkError>,
+    TransportStream: Stream<Item = Result<MultiplexMsg<Content>, TransportStreamError>>,
 {
     let mut port_pool = NumberAllocator::new();
 
-    let (service_connect_response_tx, service_connect_response_rx) = channel(1);
-    let (port_receive_resume_tx, port_receive_resume_rx) = channel(1);
+    let (channel_tx, channel_rx) = mpsc::channel(1);
 
     assert!(
         cfg.channel_rx_queue_length >= 2,
@@ -674,29 +748,20 @@ where
         resume_length: cfg.channel_rx_queue_length / 2,
         pause_length: cfg.channel_rx_queue_length,
         block_length: cfg.channel_rx_queue_length * 2,
-        resume_notify_tx: port_receive_resume_tx,
-        resume_notify_port: 0,
+        resume_notify_tx: channel_tx.clone(),
+        local_port: 0,
     };
 
     pin_mut!(transport_tx);
 
-    // Merge received transport messages into event stream.
-    let service_connect_response_rx =
-        service_connect_response_rx.map(LoopEvent::ServiceConnectResponse);
-    let port_receive_resume_rx = port_receive_resume_rx.map(LoopEvent::BufferReachedResumeLength);
+    // Create event stream.
     let transport_rx = transport_rx.map(LoopEvent::ReceiveMsg);
-    let event_rx = stream::select(
-        req_rx,
-        stream::select(
-            transport_rx,
-            stream::select(port_receive_resume_rx, service_connect_response_rx),
-        ),
-    );
+    let channel_rx = channel_rx.map(LoopEvent::ChannelMsg);
+    let connect_rx = connect_rx.map(LoopEvent::ConnectToRemoteServiceRequest);
+    let event_rx = stream::select(transport_rx, stream::select(channel_rx, connect_rx));
     pin_mut!(event_rx);
 
-    let mut client_ports = HashMap::new();
-    let mut server_ports = HashMap::new();
-    //let mut ports =
+    let mut ports: HashMap<u32, PortData<Content>> = HashMap::new();
 
     let transport_send = |msg| {
         async move {
@@ -709,9 +774,28 @@ where
 
     loop {
         match event_rx.next().await {
-            // Process send queue.
-            Some(LoopEvent::SendMsg(msg)) => {
-                transport_send(msg).await?;
+            // Send data from channel.
+            Some(LoopEvent::ChannelMsg(ChannelMsg::SendMsg {remote_port, content})) => {
+                transport_send(MultiplexMsg::Data {port: remote_port, content}).await?;
+            }
+
+            // Local channel sender has been dropped.
+            Some(LoopEvent::ChannelMsg(ChannelMsg::SenderDropped {local_port})) => {
+                let port = ports.get_mut(&local_port).expect("SenderDropped for non-existing port.");
+                port.tx_finished = true;
+                transport_send(MultiplexMsg::Finish {port: port.remote_port()}).await?;
+                // if port.tx_finished && port.rx_fin) {
+                //     drop(port);
+                //     ports.remove(&local_port);
+                //     port_pool.release(local_port);
+                // }
+            }
+
+            // Local channel receiver has been dropped.
+            Some(LoopEvent::ChannelMsg(ChannelMsg::ReceiverClosed {local_port, gracefully})) => {
+                let port = ports.get_mut(&local_port).expect("ReceiverClosed for non-existing port.");
+                port.rx_buffer = None;
+                
             }
 
             // Process received message.
