@@ -33,6 +33,8 @@ use tokio_serde::{Deserializer, Serializer};
 
 //use crate::Transport;
 
+/// Multiplexed message between two endpoints.
+#[derive(Debug)]
 pub enum MultiplexMsg<Content> {
     /// Open connection to service on specified client port.
     RequestService { service: Content, client_port: u32 },
@@ -57,10 +59,6 @@ pub enum MultiplexMsg<Content> {
     },
 }
 
-pub struct Multiplexer<ContentSerializer, ContentDeserializer> {
-    content_serializer: ContentSerializer,
-    content_deserializer: ContentDeserializer,
-}
 
 #[derive(Debug, Clone)]
 pub enum MultiplexRunError<TransportSinkError, TransportStreamError> {
@@ -72,7 +70,7 @@ pub enum MultiplexRunError<TransportSinkError, TransportStreamError> {
 }
 
 impl<TransportSinkError, TransportStreamError> From<NumberAllocatorExhaustedError> for MultiplexRunError<TransportSinkError, TransportStreamError> {
-    fn from(err: NumberAllocatorExhaustedError) -> Self {
+    fn from(_err: NumberAllocatorExhaustedError) -> Self {
         Self::PortsExhausted
     }
 }
@@ -189,7 +187,7 @@ impl ChannelSendLockAuthority {
     }
 
     /// Closes the channel.
-    async fn close(mut self, gracefully: bool) {
+    async fn close(self, gracefully: bool) {
         let mut state = self.state.lock().await;
         state.send_allowed = false;
         state.close_reason = Some(ChannelSendLockCloseReason::Closed {gracefully});
@@ -261,17 +259,20 @@ fn channel_send_lock() -> (ChannelSendLockAuthority, ChannelSendLockRequester) {
 /// Channel receiver buffer item enqueuer.
 struct ChannelReceiverBufferEnqueuer<Content> {
     state: Arc<AsyncMutex<ChannelReceiverBufferState<Content>>>,
-    cfg: ChannelReceiverBufferCfg<Content>,
+    resume_length: usize,
+    pause_length: usize,
+    block_length: usize,
 }
 
 /// Channel receiver buffer item dequeuer.
 struct ChannelReceiverBufferDequeuer<Content> {
     state: Arc<AsyncMutex<ChannelReceiverBufferState<Content>>>,
-    cfg: ChannelReceiverBufferCfg<Content>,
+    resume_length: usize,
+    resume_notify_tx: mpsc::Sender<ChannelMsg<Content>>,
+    local_port: u32,
 }
 
 /// Channel receive buffer configuration.
-#[derive(Clone)]
 struct ChannelReceiverBufferCfg<Content> {
     /// Buffer length that will trigger sending resume notification.
     resume_length: usize,
@@ -299,7 +300,7 @@ struct ChannelReceiverBufferState<Content> {
     item_dequeued: Option<oneshot::Sender<()>>,
 }
 
-impl<Content> ChannelReceiverBufferCfg<Content> {
+impl<Content> ChannelReceiverBufferCfg<Content> where Content: 'static {
     /// Creates a new channel receiver buffer and returns the associated
     /// enqueuer and dequeuer.
     fn instantiate(self) -> (
@@ -310,21 +311,25 @@ impl<Content> ChannelReceiverBufferCfg<Content> {
         assert!(self.pause_length > self.resume_length);
         assert!(self.block_length > self.pause_length);
     
-        let state = AsyncMutex::new(ChannelReceiverBufferState {
+        let state = Arc::new(AsyncMutex::new(ChannelReceiverBufferState {
             buffer: VecDeque::new(),
             enqueuer_close_reason: None,
             dequeuer_dropped: false,
             item_enqueued: None,
             item_dequeued: None,
-        });
+        }));
     
         let enqueuer = ChannelReceiverBufferEnqueuer {
             state: state.clone(),
-            cfg: self.clone(),
+            resume_length: self.resume_length,
+            pause_length: self.pause_length,
+            block_length: self.block_length,
         };
         let dequeuer = ChannelReceiverBufferDequeuer {
             state: state.clone(),
-            cfg: self,
+            resume_length: self.resume_length,
+            resume_notify_tx: self.resume_notify_tx,
+            local_port: self.local_port,
         };
         (enqueuer, dequeuer)
     }
@@ -341,12 +346,12 @@ impl<Content> ChannelReceiverBufferEnqueuer<Content> {
                 let _ = rx.await;
             }
 
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if state.dequeuer_dropped {
                 // Drop item when dequeuer has been dropped.
                 return false;
             }
-            if state.buffer.len() >= self.cfg.block_length {
+            if state.buffer.len() >= self.block_length {
                 let (tx, rx) = oneshot::channel();
                 state.item_dequeued = Some(tx);
                 rx_opt = Some(rx);
@@ -358,19 +363,19 @@ impl<Content> ChannelReceiverBufferEnqueuer<Content> {
                 let _ = tx.send(());
             }
 
-            return state.buffer.len() == self.cfg.pause_length;
+            return state.buffer.len() == self.pause_length;
         }
     }
 
     /// Returns true, if buffer length is at or below resume length.
     async fn resumeable(&self) -> bool {
         let state = self.state.lock().await;
-        state.buffer.len() <= self.cfg.resume_length
+        state.buffer.len() <= self.resume_length
     }
 
     /// Indicates that the receive stream is finished.
-    async fn close(mut self) {
-        let state = self.state.lock().await;
+    async fn close(self) {
+        let mut state = self.state.lock().await;
         state.enqueuer_close_reason = Some(ChannelReceiverBufferCloseReason::Closed);
         if let Some(tx) = state.item_enqueued.take() {
             let _ = tx.send(());
@@ -381,7 +386,7 @@ impl<Content> ChannelReceiverBufferEnqueuer<Content> {
 impl<Content> Drop for ChannelReceiverBufferEnqueuer<Content> {
     fn drop(&mut self) {
         block_on(async move {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if state.enqueuer_close_reason.is_none() {
                 state.enqueuer_close_reason = Some(ChannelReceiverBufferCloseReason::Dropped);
                 if let Some(tx) = state.item_enqueued.take() {
@@ -396,14 +401,14 @@ impl<Content> ChannelReceiverBufferDequeuer<Content> {
     /// Dequeues an item from the receive queue.
     /// Blocks until an item becomes available.
     /// Notifies the resume notify channel when the resume queue length has been reached from above.
-    async fn dequeue(&self) -> Option<Result<Content, ChannelReceiveError>> {
+    async fn dequeue(&mut self) -> Option<Result<Content, ChannelReceiveError>> {
         let mut rx_opt = None;
         loop {
             if let Some(rx) = rx_opt {
                 let _ = rx.await;
             }
 
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if state.buffer.is_empty() {
                 match &state.enqueuer_close_reason {
                     Some (ChannelReceiverBufferCloseReason::Closed) => return None,
@@ -422,10 +427,9 @@ impl<Content> ChannelReceiverBufferDequeuer<Content> {
                 let _ = tx.send(());
             }
 
-            if state.buffer.len() == self.cfg.resume_length {
-                self.cfg
-                    .resume_notify_tx
-                    .send(ChannelMsg::ReceiveBufferReachedResumeLength {local_port: self.cfg.local_port})
+            if state.buffer.len() == self.resume_length {
+                let _ = self.resume_notify_tx
+                    .send(ChannelMsg::ReceiveBufferReachedResumeLength {local_port: self.local_port})
                     .await;
             }
 
@@ -454,7 +458,7 @@ struct ChannelData<Content> {
     rx_buffer: ChannelReceiverBufferDequeuer<Content>,
 }
 
-impl<Content> ChannelData<Content> {
+impl<Content> ChannelData<Content> where Content: 'static {
     fn instantiate(self) -> (ChannelSender<Content>, ChannelReceiver<Content>) {
         let ChannelData {
             local_port, remote_port, tx, tx_lock, rx_buffer
@@ -481,12 +485,12 @@ pub struct ChannelSender<Content> {
     local_port: u32,
     remote_port: u32,
     #[pin]
-    sink: Box<
+    sink: Pin<Box<
         dyn Sink<
             Content,
             Error = ChannelSendError,
         >,
-    >,
+    >>,
     #[pin]
     drop_tx: mpsc::Sender<ChannelMsg<Content>>,
 }
@@ -504,7 +508,9 @@ impl<Content>
         Content: 'static,
     {
         let drop_tx = tx.clone();
-        let adapted_tx = tx.with(|item: Content| {
+        let tx_lock = Arc::new(tx_lock);
+        let adapted_tx = tx.with(move |item: Content| {
+            let tx_lock = tx_lock.clone();
             async move {
                 tx_lock.request().await?;
                 let msg = ChannelMsg::SendMsg {
@@ -521,9 +527,16 @@ impl<Content>
         ChannelSender {
             local_port,
             remote_port,
-            sink: Box::new(adapted_tx),
+            sink: Box::pin(adapted_tx),
             drop_tx
         }
+    }
+}
+
+impl<Item> fmt::Debug for ChannelSender<Item> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ChannelSender {{local_port={}, remote_port={}}}",
+               &self.local_port, &self.remote_port)
     }
 }
 
@@ -552,9 +565,9 @@ impl<Item> Sink<Item> for ChannelSender<Item>
 impl<Item> PinnedDrop
 for ChannelSender<Item> {
     fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
+        let mut this = self.project();
         block_on(async move {
-            this.drop_tx.send(ChannelMsg::SenderDropped {local_port: *this.local_port}).await;
+            let _ = this.drop_tx.send(ChannelMsg::SenderDropped {local_port: *this.local_port}).await;
         });
     }
 }
@@ -565,7 +578,7 @@ pub struct ChannelReceiver<Content> {
     remote_port: u32,
     closed: bool,
     #[pin]
-    stream: Box<dyn Stream<Item=Result<Content, ChannelReceiveError>>>,
+    stream: Pin<Box<dyn Stream<Item=Result<Content, ChannelReceiveError>>>>,
     #[pin]
     drop_tx: mpsc::Sender<ChannelMsg<Content>>,
 }
@@ -578,10 +591,14 @@ impl<Content> ChannelReceiver<Content> {
         rx_buffer: ChannelReceiverBufferDequeuer<Content>,
     ) -> ChannelReceiver<Content> 
     where Content: 'static {
+        let rx_buffer = Arc::new(Mutex::new(rx_buffer));
         let stream =
-            stream::repeat(()).then(|_| async move {
-                rx_buffer.dequeue().await
-            }).take_while(|opt_item| future::ready(opt_item.is_some()))
+            stream::repeat(()).then(move |_| {
+                let rx_buffer = rx_buffer.clone();
+                async move {
+                    let mut rx_buffer = rx_buffer.lock().unwrap();
+                    rx_buffer.dequeue().await
+            }}).take_while(|opt_item| future::ready(opt_item.is_some()))
             .map(|opt_item| opt_item.unwrap());
 
         ChannelReceiver {
@@ -589,7 +606,7 @@ impl<Content> ChannelReceiver<Content> {
             remote_port,
             closed: false,
             drop_tx: tx,
-            stream: Box::new(stream),
+            stream: Box::pin(stream),
         }       
     }
 
@@ -598,10 +615,17 @@ impl<Content> ChannelReceiver<Content> {
     pub fn close(&mut self) {
         if !self.closed {
             block_on(async {
-                self.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: self.local_port, gracefully: true}).await;
+                let _ = self.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: self.local_port, gracefully: true}).await;
             });        
             self.closed = true;
         }
+    }
+}
+
+impl<Item> fmt::Debug for ChannelReceiver<Item> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ChannelReceiver {{local_port={}, remote_port={}}}",
+               &self.local_port, &self.remote_port)
     }
 }
 
@@ -617,10 +641,10 @@ impl<Item> Stream for ChannelReceiver<Item>
 #[pinned_drop]
 impl<Item> PinnedDrop for ChannelReceiver<Item> {
     fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
+        let mut this = self.project();
         if !*this.closed {
             block_on(async {
-                this.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: *this.local_port, gracefully: false}).await;
+                let _ = this.drop_tx.send(ChannelMsg::ReceiverClosed {local_port: *this.local_port, gracefully: false}).await;
             });
         }
     }
@@ -631,7 +655,7 @@ struct RemoteConnectToServiceRequest<Content> {
     channel_data: Option<ChannelData<Content>>,
 }
 
-impl<Content> RemoteConnectToServiceRequest<Content> {
+impl<Content> RemoteConnectToServiceRequest<Content> where Content: 'static {
     fn new(channel_data: ChannelData<Content>)
         -> RemoteConnectToServiceRequest<Content> 
     {
@@ -641,7 +665,7 @@ impl<Content> RemoteConnectToServiceRequest<Content> {
     }
 
     /// Accepts the service request and returns a pair of channel sender and receiver.
-    pub fn accept(self) -> (ChannelSender<Content>, ChannelReceiver<Content>) {
+    pub fn accept(mut self) -> (ChannelSender<Content>, ChannelReceiver<Content>) {
         let mut channel_data = self.channel_data.take().unwrap();
         block_on(async {
             let _ = channel_data.tx.send(ChannelMsg::Accepted {local_port: channel_data.local_port}).await;
@@ -650,7 +674,7 @@ impl<Content> RemoteConnectToServiceRequest<Content> {
     }
 
     /// Rejects the service request, optionally providing the specified reason to the remote endpoint.
-    pub fn reject(self, reason: Option<Content>) {
+    pub fn reject(mut self, reason: Option<Content>) {
         let mut channel_data = self.channel_data.take().unwrap();
         block_on(async {
             let _ = channel_data.tx.send(ChannelMsg::Rejected {local_port: channel_data.local_port, reason}).await;
@@ -697,19 +721,17 @@ enum PortState<Content> {
         /// Remote port.
         remote_port: u32,
         /// Transmission lock authority.
-        tx_lock: ChannelSendLockAuthority,
+        /// Initially present, None when Hangup message has been received.
+        tx_lock: Option<ChannelSendLockAuthority>,
         /// Receive buffer enqueuer.
-        rx_buffer: ChannelReceiverBufferEnqueuer<Content>,
+        /// Initially present, None when Finish message has been received.
+        rx_buffer: Option<ChannelReceiverBufferEnqueuer<Content>>,
         /// Pause request has been sent to remote endpoint.
         rx_paused: bool,
         /// Sender has been dropped, thus no more data can be send from this port to remote endpoint.
         tx_finished: bool,
         /// Finished message has been acknowledged by remote endpoint.
         tx_finished_ack: bool,
-        /// Remote endpoint has indicated that it will send no more data to this port.
-        rx_finished: bool,
-        /// Remote endpoint has indicated that it is not interested in receiving any more data from this port.
-        rx_hangup: bool,
     },
 }
 
@@ -767,9 +789,10 @@ async fn run<
     transport_tx: TransportSink,
     transport_rx: TransportStream,
     connect_rx: mpsc::Receiver<ConnectToRemoteServiceRequest<Content>>,
-    serve_tx: mpsc::Sender<(Content, RemoteConnectToServiceRequest<Content>)>,
+    mut serve_tx: mpsc::Sender<(Content, RemoteConnectToServiceRequest<Content>)>,
 ) -> Result<(), MultiplexRunError<TransportSinkError, TransportStreamError>>
 where
+    Content: 'static,
     TransportSink: Sink<MultiplexMsg<Content>, Error = TransportSinkError>,
     TransportStream: Stream<Item = Result<MultiplexMsg<Content>, TransportStreamError>>,
 {
@@ -801,8 +824,11 @@ where
 
     let mut ports: HashMap<u32, PortState<Content>> = HashMap::new();
 
-    let transport_send = |msg| {
+    let transport_tx = Arc::new(Mutex::new(transport_tx));
+    let transport_send = move |msg| {
+        let transport_tx = transport_tx.clone();
         async move {
+            let mut transport_tx = transport_tx.lock().unwrap();
             transport_tx
                 .send(msg)
                 .await
@@ -843,10 +869,15 @@ where
 
             // Receive buffer reached resume threshold.
             Some(LoopEvent::ChannelMsg(ChannelMsg::ReceiveBufferReachedResumeLength {local_port})) => {
-                if let Some(PortState::Connected {remote_port, rx_paused, rx_finished, rx_buffer, ..}) = ports.get_mut(&local_port) {
-                    if *rx_paused && !*rx_finished && rx_buffer.resumeable().await {
-                        *rx_paused = false;
-                        transport_send(MultiplexMsg::Resume {port: *remote_port}).await?;                    
+                if let Some(PortState::Connected {remote_port, rx_paused, rx_buffer, ..}) = ports.get_mut(&local_port) {
+                    // Send resume message only, when no Finish message has been received.
+                    if let Some(rx_buffer) = rx_buffer.as_ref() {
+                        if *rx_paused && rx_buffer.resumeable().await {
+                            *rx_paused = false;
+                            transport_send(MultiplexMsg::Resume {port: *remote_port}).await?;                    
+                        }
+                    } else {
+                        panic!("ChannelMsg ReceiveBufferReachedResumeLength for already finished port {}.", &local_port);    
                     }
                 } else {
                     panic!("ChannelMsg ReceiveBufferReachedResumeLength for non-connected port {}.", &local_port);
@@ -858,13 +889,11 @@ where
                 if let Some(PortState::RemoteRequestingLocalService {remote_port, tx_lock, rx_buffer}) = ports.remove(&local_port) {
                     ports.insert(local_port, PortState::Connected {
                         remote_port,
-                        tx_lock,
-                        rx_buffer,
+                        tx_lock: Some(tx_lock),
+                        rx_buffer: Some(rx_buffer),
                         rx_paused: false,
                         tx_finished: false,
                         tx_finished_ack: false,
-                        rx_finished: false,                       
-                        rx_hangup: false
                     });
                     transport_send(MultiplexMsg::Accepted {client_port: remote_port, server_port: local_port}).await?;    
                 } else {
@@ -904,18 +933,16 @@ where
 
             // Process accepted service request message from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Accepted {client_port, server_port}))) => {
-                if let Some(PortState::LocalRequestingRemoteService {mut response_tx}) = ports.remove(&client_port) {
+                if let Some(PortState::LocalRequestingRemoteService {response_tx}) = ports.remove(&client_port) {
                     let (tx_lock_authority, tx_lock_requester) = channel_send_lock();
                     let (rx_buffer_enqueuer, rx_buffer_dequeuer) = make_channel_receiver_buffer_cfg(client_port).instantiate();                        
                     ports.insert(client_port, PortState::Connected {
                         remote_port: server_port,
-                        tx_lock: tx_lock_authority,
-                        rx_buffer: rx_buffer_enqueuer,
+                        tx_lock: Some(tx_lock_authority),
+                        rx_buffer: Some(rx_buffer_enqueuer),
                         rx_paused: false,
                         tx_finished: false,
                         tx_finished_ack: false,
-                        rx_finished: false,                       
-                        rx_hangup: false
                     });
                     let channel_data = ChannelData {
                         local_port: client_port,
@@ -925,7 +952,7 @@ where
                         rx_buffer: rx_buffer_dequeuer,
                     };
                     let (sender, receiver) = channel_data.instantiate();
-                    response_tx.send(ConnectToRemoteServiceResponse::Accepted {sender, receiver});
+                    let _ = response_tx.send(ConnectToRemoteServiceResponse::Accepted {sender, receiver});
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received accepted message for port {} not in LocalRequestingRemoteService state.", client_port)));
                 }                
@@ -933,9 +960,9 @@ where
 
             // Process rejected service request message from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Rejected {client_port, reason}))) => {
-                if let Some(PortState::LocalRequestingRemoteService {mut response_tx}) = ports.remove(&client_port) {
+                if let Some(PortState::LocalRequestingRemoteService {response_tx}) = ports.remove(&client_port) {
                     port_pool.release(client_port);
-                    response_tx.send(ConnectToRemoteServiceResponse::Rejected {reason});
+                    let _ = response_tx.send(ConnectToRemoteServiceResponse::Rejected {reason});
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received rejected message for port {} not in LocalRequestingRemoteService state.", client_port)));
                 }    
@@ -944,7 +971,10 @@ where
             // Process pause sending data request from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Pause {port}))) => {
                 if let Some(PortState::Connected {tx_lock, ..}) = ports.get_mut(&port) {
-                    tx_lock.pause().await;
+                    // Ignore request after receiving hangup message, since no more data will be transmitted anyway.
+                    if let Some(tx_lock) = tx_lock.as_mut() {
+                        tx_lock.pause().await;
+                    }
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received pause message for port {} not in Connected state.", &port)));
                 }    
@@ -953,7 +983,10 @@ where
             // Process resume sending data request from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Resume {port}))) => {
                 if let Some(PortState::Connected {tx_lock, ..}) = ports.get_mut(&port) {
-                    tx_lock.resume().await;
+                    // Ignore request after receiving hangup message, since no more data will be transmitted anyway.
+                    if let Some(tx_lock) = tx_lock.as_mut() {
+                        tx_lock.resume().await;
+                    }
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received resume message for port {} not in Connected state.", &port)));
                 }    
@@ -961,14 +994,16 @@ where
 
             // Process finish information from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Finish {port}))) => {
-                if let Some(PortState::Connected {rx_buffer, rx_finished, remote_port, ..}) = ports.get_mut(&port) {
-                    rx_buffer.close().await;
-                    *rx_finished = true;
-                    transport_send(MultiplexMsg::FinishAck {port: *remote_port}).await?;    
+                if let Some(PortState::Connected {rx_buffer, remote_port, ..}) = ports.get_mut(&port) {
+                    if let Some(rx_buffer) = rx_buffer.take() {
+                        rx_buffer.close().await;
+                        transport_send(MultiplexMsg::FinishAck {port: *remote_port}).await?;        
+                    } else {
+                        return Err(MultiplexRunError::ProtocolError(format!("Received Finish message for port {} more than once.", &port)));
+                    }
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received Finish message for port {} not in Connected state.", &port)));
                 } 
-                let port = ports.get_mut(&port).ok_or(MultiplexRunError::ProtocolError(format!("Received finish message for non-existing port {}.", port)))?;
                 // when receiving that message it means that:
                 // - we will never receive any data any more on that port
                 // - we will never send a pause/resume message
@@ -988,12 +1023,12 @@ where
 
             // Process hangup information from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Hangup {port, gracefully}))) => {                    
-                if let Some(PortState::Connected {rx_hangup, tx_lock, ..}) = ports.get_mut(&port) {
-                    if *rx_hangup {
+                if let Some(PortState::Connected {tx_lock, ..}) = ports.get_mut(&port) {
+                    if let Some(tx_lock) = tx_lock.take() {
+                        tx_lock.close(gracefully).await;  
+                    } else {
                         return Err(MultiplexRunError::ProtocolError(format!("Received more than one Hangup message for port {}.", &port)));
                     }
-                    tx_lock.close(gracefully).await;  
-                    *rx_hangup = true;    
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received Hangup message for port {} not in Connected state.", &port)));
                 } 
@@ -1001,14 +1036,15 @@ where
 
             // Process data from remote endpoint.
             Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::Data {port, content}))) => {  
-                if let Some(PortState::Connected {rx_hangup, rx_buffer, rx_paused, remote_port, ..}) = ports.get_mut(&port) {
-                    if *rx_hangup {
-                        return Err(MultiplexRunError::ProtocolError(format!("Received data after hangup for port {}.", &port)));
-                    }
-                    let pause_required = rx_buffer.enqueue(content).await;
-                    if pause_required && !*rx_paused {
-                        transport_send(MultiplexMsg::Pause {port: *remote_port}).await?;
-                        *rx_paused = true;
+                if let Some(PortState::Connected {rx_buffer, rx_paused, remote_port, ..}) = ports.get_mut(&port) {
+                    if let Some(rx_buffer) = rx_buffer.as_mut() {
+                        let pause_required = rx_buffer.enqueue(content).await;
+                        if pause_required && !*rx_paused {
+                            transport_send(MultiplexMsg::Pause {port: *remote_port}).await?;
+                            *rx_paused = true;
+                        }
+                    } else {
+                        return Err(MultiplexRunError::ProtocolError(format!("Received data after finish for port {}.", &port)));
                     }
                 } else {
                     return Err(MultiplexRunError::ProtocolError(format!("Received data for non-connected port {}.", &port)));
