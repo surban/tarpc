@@ -728,6 +728,8 @@ enum PortState<Content> {
         rx_buffer: Option<ChannelReceiverBufferEnqueuer<Content>>,
         /// Pause request has been sent to remote endpoint.
         rx_paused: bool,
+        /// Receiver has been dropped and Hangup message has been sent to remote endpoint.
+        rx_hangedup: bool,
         /// Sender has been dropped, thus no more data can be send from this port to remote endpoint.
         tx_finished: bool,
         /// Finished message has been acknowledged by remote endpoint.
@@ -846,6 +848,9 @@ where
             // Local channel sender has been dropped.
             Some(LoopEvent::ChannelMsg(ChannelMsg::SenderDropped {local_port})) => {
                 if let Some(PortState::Connected {remote_port, tx_finished, ..}) = ports.get_mut(&local_port) {
+                    if *tx_finished {
+                        panic!("ChannelMsg SenderDropped more than once for port {}.", &local_port);
+                    }
                     *tx_finished = true;
                     transport_send(MultiplexMsg::Finish {port: *remote_port}).await?;
                 } else {
@@ -860,7 +865,11 @@ where
 
             // Local channel receiver has been closed.
             Some(LoopEvent::ChannelMsg(ChannelMsg::ReceiverClosed {local_port, gracefully})) => {
-                if let Some(PortState::Connected {remote_port, ..}) = ports.get_mut(&local_port) {
+                if let Some(PortState::Connected {remote_port, rx_hangedup, ..}) = ports.get_mut(&local_port) {
+                    if *rx_hangedup {
+                        panic!("ChannelMsg ReceiverClosed more than once for port {}.", &local_port);
+                    }
+                    *rx_hangedup = true;
                     transport_send(MultiplexMsg::Hangup {port: *remote_port, gracefully}).await?;                
                 } else {
                     panic!("ChannelMsg ReceiverClosed for non-connected port {}.", &local_port);
@@ -892,6 +901,7 @@ where
                         tx_lock: Some(tx_lock),
                         rx_buffer: Some(rx_buffer),
                         rx_paused: false,
+                        rx_hangedup: false,
                         tx_finished: false,
                         tx_finished_ack: false,
                     });
@@ -941,6 +951,7 @@ where
                         tx_lock: Some(tx_lock_authority),
                         rx_buffer: Some(rx_buffer_enqueuer),
                         rx_paused: false,
+                        rx_hangedup: false,
                         tx_finished: false,
                         tx_finished_ack: false,
                     });
@@ -1008,6 +1019,23 @@ where
                 // - we will never receive any data any more on that port
                 // - we will never send a pause/resume message
                 // - it can still happen that we transmit data
+
+                // We now need to think about the conditions that ensure that we can never again
+                // send or receive a message on a channel.
+                // These conditions are:
+                // - tx_finished=true ensures that no data message can be sent
+                // - rx_buffer=None ensures that no data message can be received (Finish received)
+                // - tx_finished_ack=true ensures that no pause/resume message can be received
+                //   Does it also ensure that no Hangup message can be send? No!
+                // We also need to ensure that the closing messages will be sent
+                // in any close sequence ordering.
+                // Any simple way around having to prove that all close messages will be send?
+                // Well, we could show that as a necessary condition for the close condition to be fullfield
+                // is that we have sent the close messages.
+
+                // Close condition:
+                // 
+
             }
 
             // Process acknowledgement that our finish message has been received by remote endpoint.
