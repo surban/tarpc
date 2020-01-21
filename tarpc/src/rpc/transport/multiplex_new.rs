@@ -61,12 +61,19 @@ pub enum MultiplexMsg<Content> {
 }
 
 
+/// Channel multiplexer error.
 #[derive(Debug, Clone)]
 pub enum MultiplexRunError<TransportSinkError, TransportStreamError> {
-    SendError(TransportSinkError),
-    ReceiveError(TransportStreamError),
+    /// An error was encountered while sending data to the transport sink.
+    TransportSinkError(TransportSinkError),
+    /// An error was encountered while receiving data from the transport stream.
+    TransportStreamError(TransportStreamError),
+    /// The transport stream was close while multiplex channels were active or the 
+    /// multiplex client was not dropped.
     TransportStreamClosed,
+    /// A multiplex protocol error occured.
     ProtocolError(String),
+    /// The multiplexer ports were exhausted.
     PortsExhausted
 }
 
@@ -652,8 +659,15 @@ impl<Item> PinnedDrop for ChannelReceiver<Item> {
 }
 
 /// A service request by the remote endpoint.
-struct RemoteConnectToServiceRequest<Content> {
+/// If the request is dropped, it is automatically rejected.
+pub struct RemoteConnectToServiceRequest<Content> {
     channel_data: Option<ChannelData<Content>>,
+}
+
+impl<Content> fmt::Debug for RemoteConnectToServiceRequest<Content> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "RemoteConnectToServiceRequest")
+    }
 }
 
 impl<Content> RemoteConnectToServiceRequest<Content> where Content: 'static {
@@ -856,10 +870,6 @@ where
         let server_drop_rx = server_drop_rx.map(|()| LoopEvent::ServerDropped);
         let event_rx = stream::select(transport_rx, stream::select(channel_rx, stream::select(connect_rx, server_drop_rx)));
         
-        // How to check if server is dropped?
-        // serve_tx will be closed, but can we get notified of that?
-        // No, notify via drop implementation.
-
         // Create user objects.
         let multiplexer = Multiplexer {
             cfg,
@@ -891,7 +901,7 @@ where
     }
 
     async fn transport_send(&mut self, msg: MultiplexMsg<Content>) -> Result<(), MultiplexRunError<TransportSinkError, TransportStreamError>> {
-        self.transport_tx.send(msg).await.map_err(MultiplexRunError::SendError)        
+        self.transport_tx.send(msg).await.map_err(MultiplexRunError::TransportSinkError)        
     }
 
     fn should_terminate(&self) -> bool {
@@ -1138,7 +1148,7 @@ where
 
                 // Process receive error.
                 Some(LoopEvent::ReceiveMsg(Err(rx_err))) => {
-                    return Err(MultiplexRunError::ReceiveError(rx_err));
+                    return Err(MultiplexRunError::TransportStreamError(rx_err));
                 }
 
                 // Process local request to connect to remote service.
@@ -1190,7 +1200,33 @@ impl<Content> fmt::Debug for MultiplexerClient<Content> {
     }
 }
 
+#[derive(Debug)]
+pub enum MultiplexerConnectError<Content> {
+    /// Connection has been rejected by server with the optionally specified reason.
+    Rejected (Option<Content>),
+    /// A multiplexer error has occured or it has been terminated.
+    MultiplexerError
+}
+
+impl<Content> MultiplexerClient<Content> {
+    /// Connects to the specified service of the remote endpoint.
+    /// If connection is accepted, a pair of channel sender and receiver is returned.
+    pub async fn connect(&mut self, service: Content) -> 
+        Result<(ChannelSender<Content>, ChannelReceiver<Content>), MultiplexerConnectError<Content>> 
+    {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.connect_tx.send(ConnectToRemoteServiceRequest {service, response_tx}).await.map_err(|_| MultiplexerConnectError::MultiplexerError)?;
+        match response_rx.await {
+            Ok(ConnectToRemoteServiceResponse::Accepted {sender, receiver}) => Ok((sender, receiver)),
+            Ok(ConnectToRemoteServiceResponse::Rejected {reason}) => Err(MultiplexerConnectError::Rejected (reason)),
+            Err(_) => Err(MultiplexerConnectError::MultiplexerError)
+        }   
+    }
+}
+
+#[pin_project]
 pub struct MultiplexerServer<Content> {
+    #[pin]
     serve_rx: mpsc::Receiver<(Content, RemoteConnectToServiceRequest<Content>)>,
     drop_tx: mpsc::Sender<()>,
 }
@@ -1201,10 +1237,20 @@ impl<Content> fmt::Debug for MultiplexerServer<Content> {
     }
 }
 
-impl<Content> Drop for MultiplexerServer<Content> {
-    fn drop(&mut self) {
-        block_on(async {
-            let _ = self.drop_tx.send(()).await;
+#[pinned_drop]
+impl<Content> PinnedDrop for MultiplexerServer<Content> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        block_on(async move {
+            let _ = this.drop_tx.send(()).await;
         })
+    }
+}
+
+impl<Content> Stream for MultiplexerServer<Content> {
+    type Item = (Content, RemoteConnectToServiceRequest<Content>);
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.serve_rx.poll_next(cx)
     }
 }
