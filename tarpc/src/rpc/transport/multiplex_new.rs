@@ -65,7 +65,7 @@ pub enum MultiplexMsg<Content> {
 pub enum MultiplexRunError<TransportSinkError, TransportStreamError> {
     SendError(TransportSinkError),
     ReceiveError(TransportStreamError),
-    ReceiverClosed,
+    TransportStreamClosed,
     ProtocolError(String),
     PortsExhausted
 }
@@ -773,6 +773,12 @@ enum LoopEvent<Content, TransportStreamError> {
     ChannelMsg (ChannelMsg<Content>),
     /// Received message from transport.
     ReceiveMsg(Result<MultiplexMsg<Content>, TransportStreamError>),
+    /// Transport stream is finished.
+    TransportFinished,
+    /// MultiplexClient has been dropped.
+    ClientDropped,
+    /// MultiplexServer has been dropped.
+    ServerDropped,
     /// Connect to service with specified id on the remote side.
     ConnectToRemoteServiceRequest (ConnectToRemoteServiceRequest<Content>),
 }
@@ -799,6 +805,9 @@ pub struct Multiplexer<Content, TransportSink, TransportStream, TransportSinkErr
     channel_tx: mpsc::Sender<ChannelMsg<Content>>,
     event_rx: Pin<Box<dyn Stream<Item=LoopEvent<Content, TransportStreamError>>>>,
 
+    client_dropped: bool,
+    server_dropped: bool,
+
     _transport_stream_ghost: PhantomData<TransportStream>,
     _transport_sink_error_ghost: PhantomData<TransportSinkError>,
 }
@@ -808,6 +817,10 @@ impl<Content, TransportSink, TransportStream, TransportSinkError, TransportStrea
         write!(f, "Multiplexer {{cfg={:?}}}", &self.cfg)
     }
 }
+
+// Need global termination condition.
+// Transport sink or stream closed should be one of them.
+// Also client and server dropped and no open channels anymore.
 
 impl<Content, TransportSink, TransportStream, TransportSinkError, TransportStreamError>
     Multiplexer<Content, TransportSink, TransportStream, TransportSinkError, TransportStreamError>
@@ -834,13 +847,19 @@ where
         let (channel_tx, channel_rx) = mpsc::channel(1);
         let (connect_tx, connect_rx) = mpsc::channel(1);
         let (serve_tx, serve_rx) = mpsc::channel(cfg.service_request_queue_length);
+        let (server_drop_tx, server_drop_rx) = mpsc::channel(1);
 
         // Create event loop stream.
-        let transport_rx = transport_rx.map(LoopEvent::ReceiveMsg);
+        let transport_rx = transport_rx.map(LoopEvent::ReceiveMsg).chain(stream::once(async {LoopEvent::TransportFinished}));
         let channel_rx = channel_rx.map(LoopEvent::ChannelMsg);
-        let connect_rx = connect_rx.map(LoopEvent::ConnectToRemoteServiceRequest);
-        let event_rx = stream::select(transport_rx, stream::select(channel_rx, connect_rx));
+        let connect_rx = connect_rx.map(LoopEvent::ConnectToRemoteServiceRequest).chain(stream::once(async {LoopEvent::ClientDropped}));
+        let server_drop_rx = server_drop_rx.map(|()| LoopEvent::ServerDropped);
+        let event_rx = stream::select(transport_rx, stream::select(channel_rx, stream::select(connect_rx, server_drop_rx)));
         
+        // How to check if server is dropped?
+        // serve_tx will be closed, but can we get notified of that?
+        // No, notify via drop implementation.
+
         // Create user objects.
         let multiplexer = Multiplexer {
             cfg,
@@ -850,11 +869,13 @@ where
             port_pool: NumberAllocator::new(),
             channel_tx,
             event_rx: Box::pin(event_rx),
+            client_dropped: false,
+            server_dropped: false,
             _transport_stream_ghost: PhantomData,
             _transport_sink_error_ghost: PhantomData,
         };
         let client = MultiplexerClient {connect_tx};
-        let server = MultiplexerServer {serve_rx};
+        let server = MultiplexerServer {serve_rx, drop_tx: server_drop_tx};
 
         (multiplexer, client, server)
     }
@@ -871,6 +892,23 @@ where
 
     async fn transport_send(&mut self, msg: MultiplexMsg<Content>) -> Result<(), MultiplexRunError<TransportSinkError, TransportStreamError>> {
         self.transport_tx.send(msg).await.map_err(MultiplexRunError::SendError)        
+    }
+
+    fn should_terminate(&self) -> bool {
+        self.client_dropped && self.server_dropped && self.ports.is_empty()
+    }
+
+    fn maybe_free_port(&mut self, local_port: u32) -> bool {
+        let free =
+            if let Some(PortState::Connected {tx_lock, rx_buffer, rx_hangedup, tx_finished, tx_finished_ack, ..}) = self.ports.get(&local_port) {
+                tx_lock.is_none() && rx_buffer.is_none() && *rx_hangedup && *tx_finished && *tx_finished_ack
+            } else {
+                panic!("maybe_free_port called for port {} not in connected state.", &local_port);
+            };
+        if free {
+            self.ports.remove(&local_port);
+        }
+        self.should_terminate()
     }
 
     async fn run(mut self) -> Result<(), MultiplexRunError<TransportSinkError, TransportStreamError>> {
@@ -891,14 +929,10 @@ where
                         *tx_finished = true;
                         let msg = MultiplexMsg::Finish {port: *remote_port};
                         self.transport_send(msg).await?;
+                        if self.maybe_free_port(local_port) { break }
                     } else {
                         panic!("ChannelMsg SenderDropped for non-connected port {}.", &local_port);
                     }
-                    // if port.tx_finished && port.rx_fin) {
-                    //     drop(port);
-                    //     ports.remove(&local_port);
-                    //     port_pool.release(local_port);
-                    // }
                 }
 
                 // Local channel receiver has been closed.
@@ -909,7 +943,8 @@ where
                         }
                         *rx_hangedup = true;
                         let msg = MultiplexMsg::Hangup {port: *remote_port, gracefully};
-                        self.transport_send(msg).await?;                
+                        self.transport_send(msg).await?; 
+                        if self.maybe_free_port(local_port) { break }
                     } else {
                         panic!("ChannelMsg ReceiverClosed for non-connected port {}.", &local_port);
                     }
@@ -1050,44 +1085,23 @@ where
                             rx_buffer.close().await;
                             let msg = MultiplexMsg::FinishAck {port: *remote_port};
                             self.transport_send(msg).await?;        
+                            if self.maybe_free_port(port) { break }
                         } else {
                             return Err(MultiplexRunError::ProtocolError(format!("Received Finish message for port {} more than once.", &port)));
                         }
                     } else {
                         return Err(MultiplexRunError::ProtocolError(format!("Received Finish message for port {} not in Connected state.", &port)));
                     } 
-                    // when receiving that message it means that:
-                    // - we will never receive any data any more on that port
-                    // - we will never send a pause/resume message
-                    // - it can still happen that we transmit data
-
-                    // We now need to think about the conditions that ensure that we can never again
-                    // send or receive a message on a channel.
-                    // These conditions are:
-                    // - tx_finished=true ensures that no data message can be sent
-                    // - rx_buffer=None ensures that no data message can be received (Finish received)
-                    // - tx_finished_ack=true ensures that no pause/resume message can be received
-                    //   Does it also ensure that no Hangup message can be send? No!
-                    // We also need to ensure that the closing messages will be sent
-                    // in any close sequence ordering.
-                    // Any simple way around having to prove that all close messages will be send?
-                    // Well, we could show that as a necessary condition for the close condition to be fullfield
-                    // is that we have sent the close messages.
-
-                    // Close condition:
-                    // 
-
                 }
 
                 // Process acknowledgement that our finish message has been received by remote endpoint.
                 Some(LoopEvent::ReceiveMsg(Ok(MultiplexMsg::FinishAck {port}))) => {       
                     if let Some(PortState::Connected {tx_finished_ack, ..}) = self.ports.get_mut(&port) {
                         *tx_finished_ack = true;
+                        if self.maybe_free_port(port) { break }
                     } else {
                         return Err(MultiplexRunError::ProtocolError(format!("Received FinishAck message for port {} not in Connected state.", &port)));
                     } 
-                    // We can now be sure that remote endpoint will never send a pause/resume message anymore.
-                    // However it can still send data.
                 }
 
                 // Process hangup information from remote endpoint.
@@ -1095,6 +1109,7 @@ where
                     if let Some(PortState::Connected {tx_lock, ..}) = self.ports.get_mut(&port) {
                         if let Some(tx_lock) = tx_lock.take() {
                             tx_lock.close(gracefully).await;  
+                            if self.maybe_free_port(port) { break }
                         } else {
                             return Err(MultiplexRunError::ProtocolError(format!("Received more than one Hangup message for port {}.", &port)));
                         }
@@ -1133,9 +1148,35 @@ where
                     self.transport_send(MultiplexMsg::RequestService {service, client_port}).await?;
                 }
 
-                None => return Ok(())
+                // Process that client has been dropped.
+                Some(LoopEvent::ClientDropped) => {
+                    self.client_dropped = true;
+                    if self.should_terminate() { break }
+                }
+
+                // Process that server has been dropped.
+                Some(LoopEvent::ServerDropped) => {
+                    self.server_dropped = true;
+                    if self.should_terminate() { break }
+                }
+
+                // Transport stream has been closed.
+                Some(LoopEvent::TransportFinished) => {
+                    // If client is dropped and no multiplex connections are active,
+                    // treat transport closure as normal disconnection of remote
+                    // endpoint.
+                    if self.client_dropped && self.ports.is_empty() {
+                        break
+                    } else {
+                        return Err(MultiplexRunError::TransportStreamClosed)
+                    }
+                }
+
+                // All event streams have ended.
+                None => break
             }
         }
+        Ok(())
     }
 }
 
@@ -1151,10 +1192,19 @@ impl<Content> fmt::Debug for MultiplexerClient<Content> {
 
 pub struct MultiplexerServer<Content> {
     serve_rx: mpsc::Receiver<(Content, RemoteConnectToServiceRequest<Content>)>,
+    drop_tx: mpsc::Sender<()>,
 }
 
 impl<Content> fmt::Debug for MultiplexerServer<Content> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "MultiplexerServer")
+    }
+}
+
+impl<Content> Drop for MultiplexerServer<Content> {
+    fn drop(&mut self) {
+        block_on(async {
+            let _ = self.drop_tx.send(()).await;
+        })
     }
 }
